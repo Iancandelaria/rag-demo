@@ -102,7 +102,7 @@ chrome.exe --app="file:///C:/Projects/local-rag/index.html"
 
 
 
-\## Screenshots
+## Screenshots
 
 ### Indexed 2 Files
 ![Indexed](screenshots/01-indexed.png)
@@ -115,7 +115,7 @@ chrome.exe --app="file:///C:/Projects/local-rag/index.html"
 
 
 
-\## Why this project
+## Why this project
 
 This project shows how to build a \*\*fully local AI application\*\* that runs like a real app:
 
