@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local RAG (No Python) — Ollama + Browser</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; line-height: 1.45; }
+    h1 { font-size: 1.4rem; margin-bottom: 6px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-top: 12px; }
+    button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    input[type="text"] { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; }
+    .hint { color: #555; font-size: 0.9rem; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .sources li { margin-bottom: 6px; }
+    .badge { font-size: 0.8rem; padding: 2px 8px; border-radius: 999px; border: 1px solid #999; }
+    .ok { color: #0a6; }
+    .warn { color: #a60; }
+    .err { color: #b00; }
+    .small { font-size: 0.85rem; }
+    .progress { height: 6px; border-radius: 4px; background: #eee; overflow: hidden; }
+    .bar { height: 100%; width: 0%; background: #999; transition: width .2s ease; }
+  </style>
+  <!-- Mammoth for DOCX parsing -->
+  <script src="https://unpkg.com/mammoth/mammoth.browser.min.js"></script>
+  <!-- PDF.js for PDF text extraction -->
+  <script src="https://unpkg.com/pdfjs-dist@4.7.76/build/pdf.min.js"></script>
+  <script>
+    // Configure PDF.js worker
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@4.7.76/build/pdf.worker.min.js";
+  </script>
+</head>
+<body>
+  <h1>🔎 Local RAG — Pure HTML (talks to Ollama on localhost)</h1>
+  <div class="hint small">Models used: <span class="badge">nomic-embed-text</span> for embeddings, <span class="badge">llama3</span> for chat. All runs locally via <code>http://localhost:11434</code>.</div>
+
+  <div class="card">
+    <div class="row">
+      <input id="fileInput" type="file" multiple accept=".txt,.md,.pdf,.docx,.csv,.json" />
+      <button id="btnIndex">Build / Rebuild Index</button>
+      <button id="btnClear">Clear Index</button>
+      <span id="status" class="small"></span>
+    </div>
+    <div class="progress" style="margin-top:10px;">
+      <div id="pbar" class="bar"></div>
+    </div>
+    <div class="hint small" style="margin-top:8px;">
+      If the browser throws a CORS error, start Ollama with CORS enabled:
+      <span class="mono">$env:OLLAMA_ORIGINS="*"</span> then <span class="mono">ollama serve</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <input id="q" type="text" placeholder="Ask a question about your uploaded files…" />
+    <div class="row" style="margin-top:8px;">
+      <button id="askBtn">Ask</button>
+      <span id="llmStatus" class="small"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Answer</h3>
+    <div id="answer"></div>
+    <h3>Sources</h3>
+    <ul id="sources" class="sources"></ul>
+  </div>
+
+<script>
+const OLLAMA_URL = 'http://localhost:11434';
+const EMBED_MODEL = 'nomic-embed-text'; // run: ollama pull nomic-embed-text
+const CHAT_MODEL  = 'llama3';            // run: ollama run llama3 (service must be up)
+
+let index = []; // { id, fileName, chunk, vec: number[] }
+
+function setStatus(msg, cls='') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'small ' + cls;
+}
+function setLLMStatus(msg, cls='') {
+  const el = document.getElementById('llmStatus');
+  el.textContent = msg;
+  el.className = 'small ' + cls;
+}
+function setProgress(pct) {
+  document.getElementById('pbar').style.width = pct + '%';
+}
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+  return await res.json();
+}
+
+async function embed(text) {
+  const body = { model: EMBED_MODEL, prompt: text };
+  const data = await fetchJSON(`${OLLAMA_URL}/api/embeddings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  // Ollama returns { embedding: [...] }
+  return data.embedding;
+}
+
+function cosine(a, b) {
+  let dot=0, na=0, nb=0;
+  for (let i=0;i<a.length;i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
+}
+
+function chunkText(text, size=800, overlap=120) {
+  const chunks = [];
+  let i = 0;
+  while (i < text.length) {
+    const end = Math.min(i + size, text.length);
+    const slice = text.slice(i, end);
+    chunks.push(slice);
+    i += (size - overlap);
+  }
+  return chunks;
+}
+
+async function readFileAsText(file) {
+  const ext = file.name.toLowerCase().split('.').pop();
+  if (ext === 'txt' || ext === 'md' || ext === 'csv' || ext === 'json') {
+    return await file.text();
+  }
+  if (ext === 'docx') {
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await window.mammoth.extractRawText({ arrayBuffer });
+    return result.value || '';
+  }
+  if (ext === 'pdf') {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let fullText = '';
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      const strings = content.items.map(it => it.str).join(' ');
+      fullText += `\n\n[Page ${p}]\n` + strings;
+    }
+    return fullText;
+  }
+  throw new Error('Unsupported file type: ' + ext);
+}
+
+async function buildIndexFromFiles(fileList) {
+  index = [];
+  if (!fileList || fileList.length === 0) {
+    setStatus('No files selected', 'warn');
+    return;
+  }
+  setStatus('Checking Ollama service…');
+  // sanity call to tags (optional)
+  try { await fetchJSON(`${OLLAMA_URL}/api/tags`); } catch (e) {
+    setStatus('Cannot reach Ollama at http://localhost:11434. Start it first.', 'err');
+    return;
+  }
+  // ensure embedding model exists by calling once (will error if not pulled)
+  setStatus('Building index… this runs fully local.');
+  let done = 0;
+  for (const file of fileList) {
+    const text = await readFileAsText(file);
+    const chunks = chunkText(text);
+    for (const ch of chunks) {
+      const vec = await embed(ch);
+      index.push({ id: index.length, fileName: file.name, chunk: ch, vec });
+    }
+    done++;
+    setProgress(Math.round((done / fileList.length) * 100));
+  }
+  setStatus(`Indexed ${index.length} chunks from ${fileList.length} file(s).`, 'ok');
+}
+
+async function askLLM(question, topK=8) {
+  if (index.length === 0) {
+    throw new Error('Index is empty. Upload files and build index first.');
+  }
+  const qvec = await embed(question);
+  const scored = index.map(item => ({ ...item, score: cosine(qvec, item.vec) }))
+                      .sort((a,b) => b.score - a.score)
+                      .slice(0, topK);
+  const context = scored.map(s => `FILE: ${s.fileName}\nCONTENT:\n${s.chunk}`).join('\n\n---\n\n');
+  const prompt = `You are a precise assistant. Use ONLY the context to answer. If unsure, say you don't know.\n\nCONTEXT:\n${context}\n\nQUESTION: ${question}`;
+
+  const body = {
+    model: CHAT_MODEL,
+    messages: [
+      { role: 'system', content: 'You answer strictly from provided context and cite file names.' },
+      { role: 'user', content: prompt }
+    ],
+    stream: false
+  };
+  const data = await fetchJSON(`${OLLAMA_URL}/api/chat`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const answer = data.message?.content || '';
+  return { answer, sources: scored };
+}
+
+// UI hooks
+const fileInput = document.getElementById('fileInput');
+const btnIndex  = document.getElementById('btnIndex');
+const btnClear  = document.getElementById('btnClear');
+const askBtn    = document.getElementById('askBtn');
+const qInput    = document.getElementById('q');
+const ansDiv    = document.getElementById('answer');
+const srcList   = document.getElementById('sources');
+
+btnIndex.addEventListener('click', async () => {
+  try {
+    setProgress(0);
+    ansDiv.textContent = '';
+    srcList.innerHTML = '';
+    await buildIndexFromFiles(fileInput.files);
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+});
+
+btnClear.addEventListener('click', () => {
+  index = [];
+  setProgress(0);
+  setStatus('Index cleared.', 'warn');
+  ansDiv.textContent = '';
+  srcList.innerHTML = '';
+});
+
+askBtn.addEventListener('click', async () => {
+  const q = qInput.value.trim();
+  if (!q) return;
+  setLLMStatus('Thinking…');
+  ansDiv.textContent = '';
+  srcList.innerHTML = '';
+  try {
+    const out = await askLLM(q);
+    ansDiv.textContent = out.answer;
+    for (const s of out.sources) {
+      const li = document.createElement('li');
+      li.textContent = `${s.fileName}  (score ${s.score.toFixed(3)})`;
+      srcList.appendChild(li);
+    }
+    setLLMStatus('Done.', 'ok');
+  } catch (e) {
+    setLLMStatus(e.message, 'err');
+  }
+});
+</script>
+</body>
+</html>
