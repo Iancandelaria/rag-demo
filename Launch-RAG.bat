@@ -11,5 +11,9 @@ REM Wait until the API is up
 powershell -NoLogo -NoProfile -Command ^
   "while (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port 11434).TcpTestSucceeded) { Start-Sleep -Milliseconds 300 }"
 
+REM Build a file:/// URL to index.html based on this script's folder (no hard-coded paths)
+set "HERE=%~dp0"
+set "URL=file:///%HERE:\=/%index.html"
+
 REM Open your RAG app as a clean window (no address bar)
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --app="file:///C:/Users/Ian/OneDrive/Desktop/rag-demo/index.html"
+start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --app="%URL%"
